@@ -79,13 +79,6 @@ LoaderIter = Iterator[Batch]
 class ViTBlockAdapter(nn.Module):
     """
     Wrap a custom block so it behaves like a Hugging Face ViT encoder layer.
-
-    Expected block behavior:
-      - block(hidden_states) -> Tensor
-      - or block(hidden_states=hidden_states, ...)
-      - or block(...) -> tuple/list where the first item is the updated hidden states
-
-    The adapter always returns a tuple because HF ViT encoder layers do.
     """
 
     def __init__(self, block: nn.Module, layer_index: int):
@@ -94,12 +87,38 @@ class ViTBlockAdapter(nn.Module):
         self._dmrg_replaced = True
         self._dmrg_layer_index = int(layer_index)
 
+    @staticmethod
+    def _unwrap_hidden_states(hidden_states):
+        # Common HF-style cases
+        if isinstance(hidden_states, torch.Tensor):
+            return hidden_states
+
+        if isinstance(hidden_states, (tuple, list)):
+            if len(hidden_states) == 0:
+                raise ValueError("Received empty hidden_states tuple/list.")
+            if not isinstance(hidden_states[0], torch.Tensor):
+                raise TypeError(
+                    f"Expected first element of hidden_states tuple/list to be a Tensor, got {type(hidden_states[0])!r}"
+                )
+            return hidden_states[0]
+
+        if isinstance(hidden_states, dict):
+            if "hidden_states" in hidden_states:
+                return hidden_states["hidden_states"]
+            raise KeyError("Hidden-states dict did not contain 'hidden_states'.")
+
+        raise TypeError(
+            f"Unsupported hidden_states type in ViTBlockAdapter: {type(hidden_states)!r}"
+        )
+
     def forward(
         self,
         hidden_states: Tensor,
         head_mask: Optional[Tensor] = None,
         output_attentions: bool = False,
     ):
+        hidden_states = self._unwrap_hidden_states(hidden_states)
+
         out = None
 
         call_attempts = [
