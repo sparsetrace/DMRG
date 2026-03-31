@@ -501,8 +501,8 @@ class DMRG:
             reduction="batchmean",
         ) * (t * t)
 
-      @staticmethod
-      def _unpack_batch(batch: Batch) -> Tuple[Tensor, Optional[Tensor]]:
+    @staticmethod
+    def _unpack_batch(batch: Batch) -> Tuple[Tensor, Optional[Tensor]]:
           if isinstance(batch, Mapping):
               if "pixel_values" not in batch:
                   raise KeyError("Expected batch mapping to contain 'pixel_values'.")
