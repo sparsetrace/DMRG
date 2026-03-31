@@ -664,6 +664,37 @@ class DMRG:
         self.model.vit.encoder.layer[idx] = adapted
         return True
 
+    def _ensure_replaced(
+          self,
+          idx: int,
+          block_factory: Callable[[nn.Module, int], nn.Module],
+          ) -> bool:
+          layers = self._get_layers(self.model)
+          if self._is_replaced_layer(layers[idx]):
+              return False
+      
+          # Build the new block
+          block = block_factory(self.model, idx)
+      
+          # Match device and dtype of the layer being replaced
+          ref_layer = layers[idx]
+          ref_param = next(ref_layer.parameters(), None)
+      
+          if ref_param is not None:
+              block = block.to(device=ref_param.device, dtype=ref_param.dtype)
+          else:
+              block = block.to(device=self.device)
+      
+          adapted = ViTBlockAdapter(block, layer_index=idx)
+      
+          if ref_param is not None:
+              adapted = adapted.to(device=ref_param.device, dtype=ref_param.dtype)
+          else:
+              adapted = adapted.to(device=self.device)
+      
+          self.model.vit.encoder.layer[idx] = adapted
+          return True
+
     def _open_two_site_window(
         self,
         window: Tuple[int, int],
