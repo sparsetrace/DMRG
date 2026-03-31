@@ -256,12 +256,20 @@ class DiffusionBlock(nn.Module):
         *,
         hidden_states: Optional[torch.Tensor] = None,
         **kwargs,
-    ) -> torch.Tensor:
+        ) -> torch.Tensor:
         if hidden_states is not None:
             x = hidden_states
         if x is None:
             raise ValueError("DiffusionBlock.forward expected `x` or `hidden_states`.")
-
+    
+        if isinstance(x, (tuple, list)):
+            if len(x) == 0:
+                raise ValueError("Received empty tuple/list for x.")
+            x = x[0]
+    
+        if not isinstance(x, torch.Tensor):
+            raise TypeError(f"DiffusionBlock expected a Tensor, got {type(x)!r}")
+    
         x = x + self.drop(self.attn(self.norm1(x))) * self.gamma1
         x = x + self.drop(self.ch_attn(self.norm2(x))) * self.gamma2
         return x
