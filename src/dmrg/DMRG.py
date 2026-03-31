@@ -78,12 +78,13 @@ LoaderIter = Iterator[Batch]
 
 class ViTBlockAdapter(nn.Module):
     """
-    Wrap a custom block so it behaves like a Hugging Face ViT encoder layer.
+    Wrap a custom block so it behaves like a current Hugging Face ViT encoder layer.
 
-    Guarantees:
-      - input to the custom block is a Tensor
-      - first output returned to ViT is a Tensor
-      - no nested tuple/list structures are allowed to leak through
+    Current HF ViTLayer contract:
+      - input: hidden_states tensor
+      - output: hidden_states tensor
+
+    So this adapter must return a Tensor, not (hidden_states,) or any tuple.
     """
 
     def __init__(self, block: nn.Module, layer_index: int):
@@ -94,13 +95,11 @@ class ViTBlockAdapter(nn.Module):
 
     @staticmethod
     def _extract_tensor(x, name: str = "value") -> torch.Tensor:
-        # Unwrap nested tuple/list shells until we reach something non-sequence
         while isinstance(x, (tuple, list)):
             if len(x) == 0:
                 raise ValueError(f"{name} was an empty tuple/list.")
             x = x[0]
 
-        # Handle dict-like outputs
         if isinstance(x, dict):
             if "hidden_states" in x:
                 x = x["hidden_states"]
@@ -111,7 +110,6 @@ class ViTBlockAdapter(nn.Module):
                     f"{name} was a dict but had neither 'hidden_states' nor 'last_hidden_state'."
                 )
 
-            # In case the dict entry is itself nested
             while isinstance(x, (tuple, list)):
                 if len(x) == 0:
                     raise ValueError(f"{name} dict entry was an empty tuple/list.")
@@ -127,8 +125,8 @@ class ViTBlockAdapter(nn.Module):
         hidden_states: torch.Tensor,
         head_mask: Optional[torch.Tensor] = None,
         output_attentions: bool = False,
-    ):
-        # Normalize input coming from HF internals
+        **kwargs,
+    ) -> torch.Tensor:
         hidden_states = self._extract_tensor(hidden_states, name="hidden_states")
 
         out = None
@@ -139,14 +137,16 @@ class ViTBlockAdapter(nn.Module):
                 hidden_states=hidden_states,
                 head_mask=head_mask,
                 output_attentions=output_attentions,
+                **kwargs,
             ),
             lambda: self.block(
                 hidden_states,
                 head_mask=head_mask,
                 output_attentions=output_attentions,
+                **kwargs,
             ),
-            lambda: self.block(hidden_states=hidden_states),
-            lambda: self.block(hidden_states),
+            lambda: self.block(hidden_states=hidden_states, **kwargs),
+            lambda: self.block(hidden_states, **kwargs),
         ]
 
         for fn in call_attempts:
@@ -162,30 +162,10 @@ class ViTBlockAdapter(nn.Module):
                 "Expected a block that accepts hidden states either positionally or by keyword."
             ) from last_err
 
-        # Normalize output so the first returned item is ALWAYS a Tensor
-        attn = None
+        hidden_out = self._extract_tensor(out, name="block output")
 
-        if isinstance(out, torch.Tensor):
-            hidden_out = out
-
-        elif isinstance(out, dict):
-            hidden_out = out.get("hidden_states", out.get("last_hidden_state"))
-            attn = out.get("attentions", out.get("attention", None))
-            hidden_out = self._extract_tensor(hidden_out, name="block output")
-
-        elif isinstance(out, (tuple, list)):
-            if len(out) == 0:
-                raise ValueError("Custom block returned an empty tuple/list.")
-            hidden_out = self._extract_tensor(out[0], name="block output")
-            attn = out[1] if len(out) > 1 else None
-
-        else:
-            raise TypeError(
-                f"Unsupported block output type from adapter: {type(out)!r}. "
-                "Return a Tensor, tuple/list, or dict with hidden states."
-            )
-
-        return (hidden_out, attn) if output_attentions else (hidden_out,)
+        # IMPORTANT: current HF ViT layers return a Tensor, not a tuple.
+        return hidden_out
 
 class DMRG:
     """
