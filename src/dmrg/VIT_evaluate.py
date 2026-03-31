@@ -58,7 +58,9 @@ subset of examples.
 """
 
 import os
-from typing import Optional
+import sys
+import importlib
+from typing import Optional, Mapping
 
 import torch
 import torch.nn.functional as F
@@ -71,6 +73,27 @@ def count_params(model):
     return {"params_total": total}
 
 
+def _install_module_aliases(module_aliases: Optional[Mapping[str, str]] = None) -> None:
+    """
+    Make local modules available under alternate import names.
+
+    Example:
+        {"mhdm": "dmrg.mhdm"}
+
+    means:
+        import dmrg.mhdm as real_module
+        sys.modules["mhdm"] = real_module
+    """
+    if not module_aliases:
+        return
+
+    for wanted_name, real_name in module_aliases.items():
+        if wanted_name in sys.modules:
+            continue
+        module = importlib.import_module(real_name)
+        sys.modules[wanted_name] = module
+
+
 @torch.inference_mode()
 def VIT_metrics(
     model_id: str,
@@ -80,35 +103,40 @@ def VIT_metrics(
     max_images: Optional[int] = 50_000,
     batch_size: int = 128,
     trust_remote_code: bool = False,
-    # reproducible subset (useful when max_images << full set)
+    module_aliases: Optional[Mapping[str, str]] = None,
     shuffle_stream: bool = False,
     shuffle_buffer: int = 10_000,
     seed: int = 0,
-    # perf
     use_amp: bool = True,
     device: Optional[str] = None,
-    ) -> dict:
+) -> dict:
     if device is None:
         device = "cuda" if torch.cuda.is_available() else "cpu"
     device = torch.device(device)
 
-    # HF token plumbing (works with HF_TOKEN or HF_HUB_TOKEN)
     tok = os.environ.get("HF_HUB_TOKEN") or os.environ.get("HF_TOKEN")
     if tok:
         os.environ["HF_HUB_TOKEN"] = tok
 
+    # Make custom local modules visible to remote code if needed.
+    _install_module_aliases(module_aliases)
+
     processor = AutoImageProcessor.from_pretrained(
-        model_id, subfolder=subfolder, trust_remote_code=trust_remote_code
+        model_id,
+        subfolder=subfolder,
+        trust_remote_code=trust_remote_code,
+        token=tok,
     )
     model = AutoModelForImageClassification.from_pretrained(
-        model_id, subfolder=subfolder, trust_remote_code=trust_remote_code
+        model_id,
+        subfolder=subfolder,
+        trust_remote_code=trust_remote_code,
+        token=tok,
     ).to(device)
     model.eval()
 
     params = count_params(model)
 
-    # --- dataset stream ---
-    # token=True is newer; fallback to use_auth_token for older datasets versions
     try:
         ds = load_dataset(dataset_id, split=split, streaming=True, token=True)
     except TypeError:
@@ -118,9 +146,8 @@ def VIT_metrics(
         ds = ds.shuffle(buffer_size=shuffle_buffer, seed=seed)
 
     if max_images is not None:
-        ds = ds.take(max_images)  # ensures we evaluate exactly max_images (unless stream ends)
+        ds = ds.take(max_images)
 
-    # --- metrics ---
     n = 0
     top1 = 0
     top5 = 0
@@ -128,7 +155,6 @@ def VIT_metrics(
 
     images, labels = [], []
 
-    # AMP context for GPU
     amp_enabled = bool(use_amp and device.type == "cuda")
     autocast = torch.autocast(device_type="cuda", dtype=torch.float16, enabled=amp_enabled)
 
@@ -143,9 +169,7 @@ def VIT_metrics(
         with autocast:
             logits = model(pixel_values=pixel_values).logits
 
-        # sum loss over batch so average is correct at the end
         total_loss += F.cross_entropy(logits, y, reduction="sum").item()
-
         top1 += (logits.argmax(dim=1) == y).sum().item()
         top5 += logits.topk(5, dim=1).indices.eq(y.view(-1, 1)).any(dim=1).sum().item()
         n += y.size(0)
@@ -154,18 +178,16 @@ def VIT_metrics(
 
     for ex in ds:
         img = ex["image"]
-        if hasattr(img, "convert"):  # PIL
+        if hasattr(img, "convert"):
             img = img.convert("RGB")
         images.append(img)
 
-        # label field name is usually "label" here; keep it robust anyway
         lab = ex.get("label", ex.get("labels"))
         labels.append(int(lab))
 
         if len(images) >= batch_size:
             flush_batch()
 
-    # last partial batch
     flush_batch()
 
     if n == 0:
