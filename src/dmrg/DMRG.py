@@ -79,6 +79,11 @@ LoaderIter = Iterator[Batch]
 class ViTBlockAdapter(nn.Module):
     """
     Wrap a custom block so it behaves like a Hugging Face ViT encoder layer.
+
+    Guarantees:
+      - input to the custom block is a Tensor
+      - first output returned to ViT is a Tensor
+      - no nested tuple/list structures are allowed to leak through
     """
 
     def __init__(self, block: nn.Module, layer_index: int):
@@ -88,47 +93,62 @@ class ViTBlockAdapter(nn.Module):
         self._dmrg_layer_index = int(layer_index)
 
     @staticmethod
-    def _unwrap_hidden_states(hidden_states):
-        # Common HF-style cases
-        if isinstance(hidden_states, torch.Tensor):
-            return hidden_states
+    def _extract_tensor(x, name: str = "value") -> torch.Tensor:
+        # Unwrap nested tuple/list shells until we reach something non-sequence
+        while isinstance(x, (tuple, list)):
+            if len(x) == 0:
+                raise ValueError(f"{name} was an empty tuple/list.")
+            x = x[0]
 
-        if isinstance(hidden_states, (tuple, list)):
-            if len(hidden_states) == 0:
-                raise ValueError("Received empty hidden_states tuple/list.")
-            if not isinstance(hidden_states[0], torch.Tensor):
-                raise TypeError(
-                    f"Expected first element of hidden_states tuple/list to be a Tensor, got {type(hidden_states[0])!r}"
+        # Handle dict-like outputs
+        if isinstance(x, dict):
+            if "hidden_states" in x:
+                x = x["hidden_states"]
+            elif "last_hidden_state" in x:
+                x = x["last_hidden_state"]
+            else:
+                raise KeyError(
+                    f"{name} was a dict but had neither 'hidden_states' nor 'last_hidden_state'."
                 )
-            return hidden_states[0]
 
-        if isinstance(hidden_states, dict):
-            if "hidden_states" in hidden_states:
-                return hidden_states["hidden_states"]
-            raise KeyError("Hidden-states dict did not contain 'hidden_states'.")
+            # In case the dict entry is itself nested
+            while isinstance(x, (tuple, list)):
+                if len(x) == 0:
+                    raise ValueError(f"{name} dict entry was an empty tuple/list.")
+                x = x[0]
 
-        raise TypeError(
-            f"Unsupported hidden_states type in ViTBlockAdapter: {type(hidden_states)!r}"
-        )
+        if not isinstance(x, torch.Tensor):
+            raise TypeError(f"{name} must resolve to a Tensor, got {type(x)!r}")
+
+        return x
 
     def forward(
         self,
-        hidden_states: Tensor,
-        head_mask: Optional[Tensor] = None,
+        hidden_states: torch.Tensor,
+        head_mask: Optional[torch.Tensor] = None,
         output_attentions: bool = False,
     ):
-        hidden_states = self._unwrap_hidden_states(hidden_states)
+        # Normalize input coming from HF internals
+        hidden_states = self._extract_tensor(hidden_states, name="hidden_states")
 
         out = None
+        last_err = None
 
         call_attempts = [
-            lambda: self.block(hidden_states=hidden_states, head_mask=head_mask, output_attentions=output_attentions),
-            lambda: self.block(hidden_states, head_mask=head_mask, output_attentions=output_attentions),
+            lambda: self.block(
+                hidden_states=hidden_states,
+                head_mask=head_mask,
+                output_attentions=output_attentions,
+            ),
+            lambda: self.block(
+                hidden_states,
+                head_mask=head_mask,
+                output_attentions=output_attentions,
+            ),
             lambda: self.block(hidden_states=hidden_states),
             lambda: self.block(hidden_states),
         ]
 
-        last_err = None
         for fn in call_attempts:
             try:
                 out = fn()
@@ -142,24 +162,30 @@ class ViTBlockAdapter(nn.Module):
                 "Expected a block that accepts hidden states either positionally or by keyword."
             ) from last_err
 
+        # Normalize output so the first returned item is ALWAYS a Tensor
+        attn = None
+
         if isinstance(out, torch.Tensor):
-            return (out, None) if output_attentions else (out,)
+            hidden_out = out
 
-        if isinstance(out, (tuple, list)):
-            return tuple(out)
+        elif isinstance(out, dict):
+            hidden_out = out.get("hidden_states", out.get("last_hidden_state"))
+            attn = out.get("attentions", out.get("attention", None))
+            hidden_out = self._extract_tensor(hidden_out, name="block output")
 
-        if isinstance(out, dict):
-            hidden = out.get("hidden_states")
-            attn = out.get("attentions")
-            if hidden is None:
-                raise ValueError("Custom block returned a dict without a 'hidden_states' entry.")
-            return (hidden, attn) if output_attentions else (hidden,)
+        elif isinstance(out, (tuple, list)):
+            if len(out) == 0:
+                raise ValueError("Custom block returned an empty tuple/list.")
+            hidden_out = self._extract_tensor(out[0], name="block output")
+            attn = out[1] if len(out) > 1 else None
 
-        raise TypeError(
-            f"Unsupported block output type from adapter: {type(out)!r}. "
-            "Return a Tensor, tuple/list, or dict with 'hidden_states'."
-        )
+        else:
+            raise TypeError(
+                f"Unsupported block output type from adapter: {type(out)!r}. "
+                "Return a Tensor, tuple/list, or dict with hidden states."
+            )
 
+        return (hidden_out, attn) if output_attentions else (hidden_out,)
 
 class DMRG:
     """
