@@ -63,6 +63,7 @@ import math
 from contextlib import nullcontext
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple, Union
+from collections.abc import Mapping
 
 import torch
 import torch.nn as nn
@@ -500,23 +501,25 @@ class DMRG:
             reduction="batchmean",
         ) * (t * t)
 
-    @staticmethod
-    def _unpack_batch(batch: Batch) -> Tuple[Tensor, Optional[Tensor]]:
-        if isinstance(batch, dict):
-            if "pixel_values" not in batch:
-                raise KeyError("Expected batch dict to contain 'pixel_values'.")
-            return batch["pixel_values"], batch.get("labels")
-
-        if isinstance(batch, (tuple, list)):
-            if len(batch) == 0:
-                raise ValueError("Received an empty batch.")
-            if len(batch) == 1:
-                return batch[0], None
-            return batch[0], batch[1]
-
-        raise TypeError(
-            "Unsupported batch type. Expected a dict with pixel_values/labels or a tuple/list like (pixel_values, labels)."
-        )
+      @staticmethod
+      def _unpack_batch(batch: Batch) -> Tuple[Tensor, Optional[Tensor]]:
+          if isinstance(batch, Mapping):
+              if "pixel_values" not in batch:
+                  raise KeyError("Expected batch mapping to contain 'pixel_values'.")
+              labels = batch.get("labels", batch.get("label"))
+              return batch["pixel_values"], labels
+      
+          if isinstance(batch, (tuple, list)):
+              if len(batch) == 0:
+                  raise ValueError("Received an empty batch.")
+              if len(batch) == 1:
+                  return batch[0], None
+              return batch[0], batch[1]
+      
+          raise TypeError(
+              f"Unsupported batch type: {type(batch)!r}. "
+              "Expected a mapping with pixel_values/labels or a tuple/list like (pixel_values, labels)."
+          )
 
     def _record_window(
         self,
