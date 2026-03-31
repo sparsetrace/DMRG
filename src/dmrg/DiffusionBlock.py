@@ -262,7 +262,7 @@ class DiffusionBlock(nn.Module):
         if x is None:
             raise ValueError("DiffusionBlock.forward expected `x` or `hidden_states`.")
     
-        if isinstance(x, (tuple, list)):
+        while isinstance(x, (tuple, list)):
             if len(x) == 0:
                 raise ValueError("Received empty tuple/list for x.")
             x = x[0]
