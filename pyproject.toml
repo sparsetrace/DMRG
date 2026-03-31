@@ -1,0 +1,42 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "viu"
+version = "0.0.1"
+description = "ViU"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+
+authors = [
+  { name = "Julio Candanedo", email = "julio@sparsetrace.ai" }
+]
+
+dependencies = [
+  "numpy>=1.24",
+  "jax>=0.4.20",
+  "flax>=0.8.0",
+  "optax>=0.2.2",
+  "plotly==5.24.1",
+  "modal>=0.64",
+  "huggingface_hub>=0.20.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=7.0",
+  "ruff>=0.3.0",
+  "black>=24.0",
+]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
