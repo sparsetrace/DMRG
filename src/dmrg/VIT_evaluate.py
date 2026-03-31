@@ -67,6 +67,10 @@ import torch.nn.functional as F
 from datasets import load_dataset
 from transformers import AutoImageProcessor, AutoModelForImageClassification
 
+import sys
+import importlib
+
+sys.modules["mhdm"] = importlib.import_module("dmrg.mhdm")
 
 def count_params(model):
     total = sum(p.numel() for p in model.parameters())
