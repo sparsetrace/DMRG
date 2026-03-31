@@ -23,22 +23,13 @@ The workflow is:
       (0, 1), (1, 2), ..., (L-2, L-1)
 6. Repeat for additional sweeps if requested.
 
-Why this is useful
-------------------
-This is intended for block-wise model rewriting / compression. For example,
-you can start from a pretrained ViT and gradually replace its standard blocks
-with cheaper or more structured student blocks while preserving performance
-through task loss and optional teacher distillation.
-
-Current scope
--------------
-- ViT only (Hugging Face ViTForImageClassification-style models)
-- Two-site down-up sweeps
-- Lazy block replacement during the first down pass
-- Optional teacher distillation
-- Local checkpointing after each window
-- Optional upload to the Hugging Face Hub
-- Optional saving of the image processor into each checkpoint
+What gets saved in each checkpoint
+----------------------------------
+- model weights/config
+- image processor (if available)
+- dmrg_meta.json with checkpoint metadata
+- source file for the realized replacement block class
+- any extra source files you ask DMRG to copy (e.g. mhdm.py)
 
 Important assumption
 --------------------
@@ -53,6 +44,7 @@ import copy
 import inspect
 import json
 import math
+import shutil
 from collections.abc import Mapping
 from contextlib import nullcontext
 from pathlib import Path
@@ -171,6 +163,7 @@ class DMRG:
       - if repo_id is given, checkpoints are also uploaded to the Hub
       - if hub_path is given, checkpoints are uploaded inside that repo subfolder
       - if image_processor is available, it is saved into each checkpoint folder
+      - source code files for the replacement block can be copied into each checkpoint
     """
 
     def __init__(
@@ -184,6 +177,8 @@ class DMRG:
         processor_subfolder: Optional[str] = None,
         trust_remote_code_model: bool = False,
         trust_remote_code_processor: bool = False,
+        extra_source_files: Optional[Sequence[Union[str, Path]]] = None,
+        save_block_source: bool = True,
         device: str = "auto",
         hf_token: Optional[str] = None,
     ) -> None:
@@ -197,6 +192,17 @@ class DMRG:
         self.processor_subfolder = processor_subfolder if processor_subfolder is not None else model_subfolder
         self.trust_remote_code_model = trust_remote_code_model
         self.trust_remote_code_processor = trust_remote_code_processor
+
+        self.base_model_repo: Optional[str] = model if isinstance(model, str) else None
+        self.base_model_subfolder: Optional[str] = model_subfolder
+
+        self.extra_source_files: List[Path] = [Path(p).expanduser().resolve() for p in (extra_source_files or [])]
+        self.save_block_source = bool(save_block_source)
+
+        self._active_new_block_spec: Optional[Union[nn.Module, type, Callable[..., nn.Module]]] = None
+        self._captured_block_source_path: Optional[Path] = None
+        self._captured_block_module_name: Optional[str] = None
+        self._captured_block_class_name: Optional[str] = None
 
         self.model = self._load_model(model, subfolder=self.model_subfolder)
         self.teacher = self._load_teacher(teacher, model)
@@ -280,6 +286,8 @@ class DMRG:
         output_dir = Path(output_dir)
         block_kwargs = block_kwargs or {}
         block_factory = self._make_block_factory(new_block, block_kwargs=block_kwargs)
+
+        self._active_new_block_spec = new_block
 
         layers = self._get_layers(self.model)
         num_layers = len(layers)
@@ -391,6 +399,7 @@ class DMRG:
                 "kind": "final",
                 "num_layers": len(self._get_layers(self.model)),
                 "studentized_layers": self.count_replaced_layers(),
+                "replaced_layer_indices": self._current_replaced_layer_indices(),
                 "windows_completed": len(self.history),
             }
             self._save_checkpoint(
@@ -410,7 +419,7 @@ class DMRG:
         return self.run(new_block, **kwargs)
 
     def count_replaced_layers(self) -> int:
-        return sum(1 for layer in self._get_layers(self.model) if self._is_replaced_layer(layer))
+        return len(self._current_replaced_layer_indices())
 
     # ------------------------------------------------------------------
     # Model loading / validation
@@ -502,6 +511,13 @@ class DMRG:
     def _get_layers(model: nn.Module) -> List[nn.Module]:
         return list(model.vit.encoder.layer)
 
+    def _current_replaced_layer_indices(self) -> List[int]:
+        return [
+            idx
+            for idx, layer in enumerate(self._get_layers(self.model))
+            if self._is_replaced_layer(layer)
+        ]
+
     @staticmethod
     def _count_trainable_params(model: nn.Module) -> int:
         return sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -572,6 +588,7 @@ class DMRG:
             "window": [int(window[0]), int(window[1])],
             "replaced_now": [int(x) for x in replaced_now],
             "studentized_layers": self.count_replaced_layers(),
+            "replaced_layer_indices": self._current_replaced_layer_indices(),
             "num_layers": len(self._get_layers(self.model)),
             "metrics": metrics,
         }
@@ -584,6 +601,61 @@ class DMRG:
             return tag
         prefix = hub_path.strip("/")
         return f"{prefix}/{tag}"
+
+    @staticmethod
+    def _dedupe_paths(paths: Sequence[Path]) -> List[Path]:
+        seen = set()
+        out: List[Path] = []
+        for p in paths:
+            rp = p.resolve()
+            if rp not in seen:
+                seen.add(rp)
+                out.append(rp)
+        return out
+
+    @staticmethod
+    def _resolve_source_path(obj: Any) -> Optional[Path]:
+        try:
+            src = inspect.getsourcefile(obj)
+            if src is None:
+                src = inspect.getfile(obj)
+        except Exception:
+            return None
+        if src is None:
+            return None
+        return Path(src).resolve()
+
+    def _capture_realized_block_info(self, block: nn.Module) -> None:
+        if self._captured_block_source_path is None:
+            src = self._resolve_source_path(block.__class__)
+            if src is not None:
+                self._captured_block_source_path = src
+
+        if self._captured_block_class_name is None:
+            self._captured_block_class_name = block.__class__.__name__
+
+        if self._captured_block_module_name is None:
+            self._captured_block_module_name = block.__class__.__module__
+
+    def _collect_checkpoint_source_paths(self) -> List[Path]:
+        paths: List[Path] = []
+
+        if self.save_block_source and self._captured_block_source_path is not None:
+            paths.append(self._captured_block_source_path)
+
+        paths.extend(self.extra_source_files)
+
+        return self._dedupe_paths(paths)
+
+    def _copy_checkpoint_source_files(self, ckpt_dir: Path) -> List[str]:
+        copied: List[str] = []
+        for src in self._collect_checkpoint_source_paths():
+            if not src.exists():
+                raise FileNotFoundError(f"Requested source file for checkpoint copy does not exist: {src}")
+            dst = ckpt_dir / src.name
+            shutil.copy2(src, dst)
+            copied.append(src.name)
+        return copied
 
     # ------------------------------------------------------------------
     # Block creation / surgery
@@ -598,12 +670,10 @@ class DMRG:
         template_module = new_block if isinstance(new_block, nn.Module) else None
 
         if template_module is not None:
-
             def factory(model: nn.Module, layer_index: int) -> nn.Module:
                 block = copy.deepcopy(template_module)
                 self._maybe_configure_block(block, model=model, layer_index=layer_index, block_kwargs=block_kwargs)
                 return block
-
             return factory
 
         if inspect.isclass(new_block) and issubclass(new_block, nn.Module):
@@ -612,7 +682,6 @@ class DMRG:
             def factory(model: nn.Module, layer_index: int) -> nn.Module:
                 kwargs = self._build_block_kwargs(signature_target, model, layer_index, block_kwargs)
                 return new_block(**kwargs)
-
             return factory
 
         if callable(new_block):
@@ -624,7 +693,6 @@ class DMRG:
                 if not isinstance(block, nn.Module):
                     raise TypeError("Custom block factory must return a torch.nn.Module.")
                 return block
-
             return factory
 
         raise TypeError(
@@ -695,6 +763,7 @@ class DMRG:
             return False
 
         block = block_factory(self.model, idx)
+        self._capture_realized_block_info(block)
 
         ref_layer = layers[idx]
         ref_param = next(ref_layer.parameters(), None)
@@ -919,11 +988,30 @@ class DMRG:
         else:
             torch.save(self.model.state_dict(), ckpt_dir / "pytorch_model.bin")
 
+        processor_saved = False
         if self.image_processor is not None and hasattr(self.image_processor, "save_pretrained"):
             self.image_processor.save_pretrained(ckpt_dir)
+            processor_saved = True
+
+        copied_source_files = self._copy_checkpoint_source_files(ckpt_dir)
+
+        meta = dict(record)
+        meta.update(
+            {
+                "base_model_repo": self.base_model_repo,
+                "base_model_subfolder": self.base_model_subfolder,
+                "processor_subfolder": self.processor_subfolder,
+                "block_class_name": self._captured_block_class_name,
+                "block_module_name": self._captured_block_module_name,
+                "block_source_file": None if self._captured_block_source_path is None else self._captured_block_source_path.name,
+                "copied_source_files": copied_source_files,
+                "processor_saved": processor_saved,
+                "save_block_source": self.save_block_source,
+            }
+        )
 
         with open(ckpt_dir / "dmrg_meta.json", "w", encoding="utf-8") as f:
-            json.dump(record, f, indent=2)
+            json.dump(meta, f, indent=2)
 
         if repo_id is not None:
             try:
