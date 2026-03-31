@@ -23,6 +23,7 @@ dependencies = [
   "plotly==5.24.1",
   "modal>=0.64",
   "numpy>=1.24",
+  "python-dotenv>=1.0",
 ]
 
 [project.optional-dependencies]
