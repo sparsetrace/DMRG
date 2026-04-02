@@ -5,21 +5,25 @@ Evaluate either:
 1) a standard Hugging Face image-classification model, or
 2) a DMRG checkpoint folder/repo produced by the newer DMRG.py style.
 
-What this adds relative to the earlier evaluator:
-- auto-detects `dmrg_meta.json`
-- reconstructs replaced ViT encoder layers before loading checkpoint weights
-- still works for normal HF repos with plain `AutoModelForImageClassification`
-- can load from a local path or a Hub repo/subfolder
+What this supports
+------------------
+- normal HF loading with AutoImageProcessor + AutoModelForImageClassification
+- DMRG checkpoint detection via dmrg_meta.json
+- reconstruction of replaced ViT encoder layers before loading checkpoint weights
+- fallback model construction from local config.json when dmrg_meta.json lacks base_model_repo
+- fallback processor loading when checkpoint lacks preprocessor_config.json
+- optional local module aliases for custom imports like `mhdm`
 
 Important limitation
 --------------------
-The current DMRG checkpoint metadata stores one replacement block class/module
-for all replaced layers. This loader therefore assumes all replaced layers use
-that same block class. If you later move to heterogeneous per-layer block types,
-you should also save a per-layer architecture manifest and update this loader.
+This loader assumes one replacement block class for all replaced layers unless you
+provide per-layer constructor kwargs. That matches the current newer DMRG saver,
+which records one block class/module/source globally rather than a full per-layer
+architecture manifest.
 """
 
 import importlib
+import importlib.util
 import inspect
 import json
 import os
@@ -31,7 +35,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from datasets import load_dataset
-from transformers import AutoImageProcessor, AutoModelForImageClassification
+from transformers import AutoConfig, AutoImageProcessor, AutoModelForImageClassification
 
 
 # -----------------------------------------------------------------------------
@@ -39,7 +43,7 @@ from transformers import AutoImageProcessor, AutoModelForImageClassification
 # -----------------------------------------------------------------------------
 
 
-def count_params(model: nn.Module) -> dict:
+def count_params(model: nn.Module) -> dict[str, int]:
     total = sum(p.numel() for p in model.parameters())
     return {"params_total": total}
 
@@ -155,7 +159,11 @@ class ViTBlockAdapter(nn.Module):
 # -----------------------------------------------------------------------------
 
 
-def _resolve_repo_or_local_dir(model_id_or_path: str, subfolder: Optional[str], token: Optional[str]) -> Path:
+def _resolve_repo_or_local_dir(
+    model_id_or_path: str,
+    subfolder: Optional[str],
+    token: Optional[str],
+) -> Path:
     """
     Return a local directory containing the requested model/checkpoint.
 
@@ -172,12 +180,70 @@ def _resolve_repo_or_local_dir(model_id_or_path: str, subfolder: Optional[str], 
             raise ImportError(
                 "Loading a Hub DMRG checkpoint requires `huggingface_hub` to be installed."
             ) from exc
+
         root = Path(snapshot_download(repo_id=model_id_or_path, token=token)).resolve()
 
     ckpt_dir = root / subfolder if subfolder else root
     if not ckpt_dir.exists():
         raise FileNotFoundError(f"Requested checkpoint directory does not exist: {ckpt_dir}")
     return ckpt_dir
+
+
+def _find_dmrg_checkpoint_dir(
+    model_id_or_path: str,
+    subfolder: Optional[str],
+    token: Optional[str],
+) -> Optional[Path]:
+    """
+    Best-effort detection for a DMRG checkpoint.
+
+    For local paths, check immediately.
+    For Hub repos, try to fetch dmrg_meta.json only; if present, snapshot the repo.
+    """
+    candidate = Path(model_id_or_path).expanduser()
+    if candidate.exists():
+        ckpt_dir = candidate.resolve() / subfolder if subfolder else candidate.resolve()
+        if (ckpt_dir / "dmrg_meta.json").exists():
+            return ckpt_dir
+        return None
+
+    try:
+        from huggingface_hub import hf_hub_download
+    except ImportError:
+        return None
+
+    try:
+        hf_hub_download(
+            repo_id=model_id_or_path,
+            filename="dmrg_meta.json",
+            subfolder=subfolder,
+            token=token,
+        )
+    except Exception:
+        return None
+
+    return _resolve_repo_or_local_dir(model_id_or_path, subfolder=subfolder, token=token)
+
+
+def _load_module_from_file(path: Path):
+    """
+    Import a Python module directly from a file path with a unique temporary module name.
+    """
+    if not path.exists():
+        raise FileNotFoundError(f"Cannot import missing module file: {path}")
+
+    unique_name = f"_dmrg_ckpt_{path.stem}_{abs(hash(str(path)))}"
+    if unique_name in sys.modules:
+        return sys.modules[unique_name]
+
+    spec = importlib.util.spec_from_file_location(unique_name, str(path))
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Could not build import spec for {path}")
+
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[unique_name] = module
+    spec.loader.exec_module(module)
+    return module
 
 
 def _import_module_from_checkpoint(
@@ -199,8 +265,7 @@ def _import_module_from_checkpoint(
     if source_file:
         path = ckpt_dir / source_file
         if path.exists():
-            mod_name = Path(source_file).stem
-            return importlib.import_module(mod_name)
+            return _load_module_from_file(path)
 
     if not module_name:
         raise ValueError("Need either source_file or module_name to import the custom block module.")
@@ -209,8 +274,54 @@ def _import_module_from_checkpoint(
         return importlib.import_module(module_name)
     except Exception:
         if "." in module_name:
-            return importlib.import_module(module_name.split(".")[-1])
+            try:
+                return importlib.import_module(module_name.split(".")[-1])
+            except Exception:
+                pass
         raise
+
+
+def _module_defined_nn_module_classes(module) -> list[type[nn.Module]]:
+    """
+    Find nn.Module subclasses defined directly in a module.
+    """
+    out: list[type[nn.Module]] = []
+    for name, obj in vars(module).items():
+        if not inspect.isclass(obj):
+            continue
+        if not issubclass(obj, nn.Module):
+            continue
+        if obj.__module__ != module.__name__:
+            continue
+        if name in {"ViTBlockAdapter", "DMRG"}:
+            continue
+        out.append(obj)
+    return out
+
+
+def _choose_unique_block_class(candidates: list[type[nn.Module]], context: str) -> type[nn.Module]:
+    """
+    Choose a likely block class from candidates, or raise if ambiguous.
+    """
+    if not candidates:
+        raise ValueError(f"No nn.Module subclasses found in {context}.")
+
+    if len(candidates) == 1:
+        return candidates[0]
+
+    preferred = [
+        cls for cls in candidates
+        if ("Block" in cls.__name__ or "Layer" in cls.__name__)
+        and not cls.__name__.endswith("Adapter")
+    ]
+    if len(preferred) == 1:
+        return preferred[0]
+
+    names = ", ".join(cls.__name__ for cls in candidates)
+    raise ValueError(
+        f"Could not uniquely infer the custom block class from {context}. "
+        f"Candidates: {names}. Pass dmrg_block_class_name and/or dmrg_block_source_file explicitly."
+    )
 
 
 # -----------------------------------------------------------------------------
@@ -268,6 +379,80 @@ def _instantiate_replacement_block(
     return block
 
 
+def _infer_block_ctor(
+    ckpt_dir: Path,
+    meta: Mapping[str, Any],
+    *,
+    dmrg_block_class_name: Optional[str] = None,
+    dmrg_block_module_name: Optional[str] = None,
+    dmrg_block_source_file: Optional[str] = None,
+):
+    """
+    Infer the custom replacement block constructor from:
+    1) explicit overrides
+    2) dmrg_meta.json fields
+    3) scanning .py files in the checkpoint directory
+    """
+    class_name = dmrg_block_class_name or meta.get("block_class_name")
+    module_name = dmrg_block_module_name or meta.get("block_module_name")
+    source_file = dmrg_block_source_file or meta.get("block_source_file")
+
+    if source_file or module_name:
+        module = _import_module_from_checkpoint(
+            ckpt_dir,
+            module_name=module_name,
+            source_file=source_file,
+        )
+        if class_name:
+            if not hasattr(module, class_name):
+                raise AttributeError(
+                    f"Module {module.__name__!r} does not define class {class_name!r}."
+                )
+            return getattr(module, class_name)
+        return _choose_unique_block_class(
+            _module_defined_nn_module_classes(module),
+            context=f"module {module.__name__}",
+        )
+
+    py_files = sorted(
+        p for p in ckpt_dir.glob("*.py")
+        if p.name not in {"__init__.py", "VIT_evaluate.py", "DMRG.py", "dmrg.py"}
+    )
+
+    all_candidates: list[tuple[Path, type[nn.Module]]] = []
+    for path in py_files:
+        try:
+            module = _load_module_from_file(path)
+            classes = _module_defined_nn_module_classes(module)
+            for cls in classes:
+                all_candidates.append((path, cls))
+        except Exception:
+            continue
+
+    if not all_candidates:
+        raise ValueError(
+            "Could not infer the custom block constructor. "
+            "No usable nn.Module subclasses were found in checkpoint .py files. "
+            "Pass dmrg_block_class_name and/or dmrg_block_source_file explicitly."
+        )
+
+    preferred = [
+        (path, cls)
+        for path, cls in all_candidates
+        if ("Block" in cls.__name__ or "Layer" in cls.__name__)
+    ]
+    pool = preferred if preferred else all_candidates
+
+    if len(pool) == 1:
+        return pool[0][1]
+
+    names = ", ".join(f"{cls.__name__} ({path.name})" for path, cls in pool)
+    raise ValueError(
+        "Could not uniquely infer the custom block constructor from checkpoint files. "
+        f"Candidates: {names}. Pass dmrg_block_class_name and/or dmrg_block_source_file explicitly."
+    )
+
+
 def _replace_dmrg_layers(
     model: nn.Module,
     meta: Mapping[str, Any],
@@ -275,29 +460,32 @@ def _replace_dmrg_layers(
     *,
     dmrg_block_kwargs: Optional[Mapping[str, Any]] = None,
     dmrg_block_kwargs_by_layer: Optional[Mapping[int, Mapping[str, Any]]] = None,
+    dmrg_replaced_layer_indices: Optional[list[int]] = None,
+    dmrg_block_class_name: Optional[str] = None,
+    dmrg_block_module_name: Optional[str] = None,
+    dmrg_block_source_file: Optional[str] = None,
 ) -> None:
-    replaced = [int(x) for x in meta.get("replaced_layer_indices", [])]
+    replaced = dmrg_replaced_layer_indices
+    if replaced is None:
+        replaced = meta.get("replaced_layer_indices", [])
+
+    replaced = [int(x) for x in replaced]
     if not replaced:
-        return
-
-    block_class_name = meta.get("block_class_name")
-    block_module_name = meta.get("block_module_name")
-    block_source_file = meta.get("block_source_file")
-
-    if not block_class_name:
         raise ValueError(
-            "dmrg_meta.json does not contain block_class_name; cannot reconstruct replaced layers."
+            "Could not determine which layers were replaced. "
+            "dmrg_meta.json lacks `replaced_layer_indices`, and no override was provided."
         )
 
-    mod = _import_module_from_checkpoint(
+    block_ctor = _infer_block_ctor(
         ckpt_dir,
-        module_name=block_module_name,
-        source_file=block_source_file,
+        meta,
+        dmrg_block_class_name=dmrg_block_class_name,
+        dmrg_block_module_name=dmrg_block_module_name,
+        dmrg_block_source_file=dmrg_block_source_file,
     )
-    block_ctor = getattr(mod, block_class_name)
 
     for idx in replaced:
-        per_layer_kwargs = {}
+        per_layer_kwargs: dict[str, Any] = {}
         if dmrg_block_kwargs:
             per_layer_kwargs.update(dict(dmrg_block_kwargs))
         if dmrg_block_kwargs_by_layer and idx in dmrg_block_kwargs_by_layer:
@@ -307,9 +495,12 @@ def _replace_dmrg_layers(
 
         ref_layer = model.vit.encoder.layer[idx]
         ref_param = next(ref_layer.parameters(), None)
+
         if ref_param is not None:
             block = block.to(device=ref_param.device, dtype=ref_param.dtype)
+
         adapted = ViTBlockAdapter(block, layer_index=idx)
+
         if ref_param is not None:
             adapted = adapted.to(device=ref_param.device, dtype=ref_param.dtype)
 
@@ -331,9 +522,11 @@ def _load_checkpoint_weights(model: nn.Module, ckpt_dir: Path) -> None:
             ) from exc
         state = load_file(str(safetensors_file))
         missing, unexpected = model.load_state_dict(state, strict=False)
+
     elif pytorch_bin.exists():
         state = torch.load(str(pytorch_bin), map_location="cpu")
         missing, unexpected = model.load_state_dict(state, strict=False)
+
     elif safetensors_index.exists() or pytorch_index.exists():
         try:
             from transformers.modeling_utils import load_sharded_checkpoint
@@ -342,6 +535,7 @@ def _load_checkpoint_weights(model: nn.Module, ckpt_dir: Path) -> None:
                 "Loading sharded checkpoints requires transformers.modeling_utils.load_sharded_checkpoint."
             ) from exc
         missing, unexpected = load_sharded_checkpoint(model, str(ckpt_dir), strict=False)
+
     else:
         raise FileNotFoundError(
             f"No supported weight file found in {ckpt_dir} "
@@ -354,6 +548,116 @@ def _load_checkpoint_weights(model: nn.Module, ckpt_dir: Path) -> None:
         print(f"[load warning] missing keys when loading checkpoint: {len(missing)}")
 
 
+def _build_base_model_for_dmrg(
+    ckpt_dir: Path,
+    meta: Mapping[str, Any],
+    *,
+    trust_remote_code: bool,
+    token: Optional[str],
+) -> nn.Module:
+    """
+    Build the base model for a DMRG checkpoint.
+
+    Preference:
+    1) if dmrg_meta.json contains base_model_repo, use that config source
+    2) otherwise use ckpt_dir/config.json directly
+    """
+    base_model_repo = meta.get("base_model_repo")
+    base_model_subfolder = meta.get("base_model_subfolder")
+
+    if base_model_repo:
+        cfg_source = base_model_repo
+        cfg_subfolder = base_model_subfolder
+    else:
+        cfg_source = str(ckpt_dir)
+        cfg_subfolder = None
+
+    cfg = AutoConfig.from_pretrained(
+        cfg_source,
+        subfolder=cfg_subfolder,
+        trust_remote_code=trust_remote_code,
+        token=token,
+    )
+
+    try:
+        model = AutoModelForImageClassification.from_config(
+            cfg,
+            trust_remote_code=trust_remote_code,
+        )
+    except TypeError:
+        model = AutoModelForImageClassification.from_config(cfg)
+
+    return model
+
+
+def _load_processor_with_fallbacks(
+    model_id_or_path: str,
+    ckpt_dir: Path,
+    meta: Mapping[str, Any],
+    *,
+    trust_remote_code: bool,
+    token: Optional[str],
+    fallback_processor_id: Optional[str] = None,
+    fallback_processor_subfolder: Optional[str] = None,
+    config_name_or_path: Optional[str] = None,
+):
+    """
+    Try several places for the image processor.
+
+    Order:
+    1) checkpoint folder itself
+    2) repo/path root (without subfolder)
+    3) base_model_repo + processor_subfolder/base_model_subfolder from meta
+    4) config._name_or_path if it looks usable
+    5) explicit fallback processor args
+    """
+    candidates: list[tuple[str, Optional[str]]] = []
+    seen: set[tuple[str, Optional[str]]] = set()
+
+    def add_candidate(source: Optional[str], sf: Optional[str]) -> None:
+        if not source:
+            return
+        key = (source, sf)
+        if key not in seen:
+            seen.add(key)
+            candidates.append(key)
+
+    add_candidate(str(ckpt_dir), None)
+    add_candidate(model_id_or_path, None)
+
+    base_model_repo = meta.get("base_model_repo")
+    processor_subfolder = meta.get("processor_subfolder")
+    base_model_subfolder = meta.get("base_model_subfolder")
+
+    add_candidate(base_model_repo, processor_subfolder)
+    add_candidate(base_model_repo, base_model_subfolder)
+    add_candidate(base_model_repo, None)
+
+    if config_name_or_path and config_name_or_path not in {str(ckpt_dir), model_id_or_path}:
+        add_candidate(config_name_or_path, None)
+
+    add_candidate(fallback_processor_id, fallback_processor_subfolder)
+    add_candidate(fallback_processor_id, None)
+
+    last_err = None
+    for source, sf in candidates:
+        try:
+            return AutoImageProcessor.from_pretrained(
+                source,
+                subfolder=sf,
+                trust_remote_code=trust_remote_code,
+                token=token,
+            )
+        except Exception as exc:
+            last_err = exc
+
+    raise RuntimeError(
+        "Could not load an image processor. "
+        "The checkpoint folder does not contain preprocessor_config.json, "
+        "and no fallback processor source worked."
+    ) from last_err
+
+
 def _load_dmrg_model_and_processor(
     model_id_or_path: str,
     *,
@@ -363,6 +667,12 @@ def _load_dmrg_model_and_processor(
     module_aliases: Optional[Mapping[str, str]],
     dmrg_block_kwargs: Optional[Mapping[str, Any]],
     dmrg_block_kwargs_by_layer: Optional[Mapping[int, Mapping[str, Any]]],
+    dmrg_replaced_layer_indices: Optional[list[int]],
+    dmrg_block_class_name: Optional[str],
+    dmrg_block_module_name: Optional[str],
+    dmrg_block_source_file: Optional[str],
+    fallback_processor_id: Optional[str],
+    fallback_processor_subfolder: Optional[str],
     device: torch.device,
 ):
     ckpt_dir = _resolve_repo_or_local_dir(model_id_or_path, subfolder=subfolder, token=token)
@@ -372,18 +682,12 @@ def _load_dmrg_model_and_processor(
 
     if str(ckpt_dir) not in sys.path:
         sys.path.insert(0, str(ckpt_dir))
+
     _install_module_aliases(module_aliases)
 
-    base_model_repo = meta.get("base_model_repo")
-    if not base_model_repo:
-        raise ValueError(
-            "dmrg_meta.json does not contain `base_model_repo`. "
-            "Current evaluator expects DMRG checkpoints saved from a named base model."
-        )
-
-    model = AutoModelForImageClassification.from_pretrained(
-        base_model_repo,
-        subfolder=meta.get("base_model_subfolder"),
+    model = _build_base_model_for_dmrg(
+        ckpt_dir,
+        meta,
         trust_remote_code=trust_remote_code,
         token=token,
     )
@@ -394,25 +698,26 @@ def _load_dmrg_model_and_processor(
         ckpt_dir,
         dmrg_block_kwargs=dmrg_block_kwargs,
         dmrg_block_kwargs_by_layer=dmrg_block_kwargs_by_layer,
+        dmrg_replaced_layer_indices=dmrg_replaced_layer_indices,
+        dmrg_block_class_name=dmrg_block_class_name,
+        dmrg_block_module_name=dmrg_block_module_name,
+        dmrg_block_source_file=dmrg_block_source_file,
     )
+
     _load_checkpoint_weights(model, ckpt_dir)
     model.to(device)
     model.eval()
 
-    processor = None
-    try:
-        processor = AutoImageProcessor.from_pretrained(
-            str(ckpt_dir),
-            trust_remote_code=trust_remote_code,
-            token=token,
-        )
-    except Exception:
-        processor = AutoImageProcessor.from_pretrained(
-            base_model_repo,
-            subfolder=meta.get("processor_subfolder"),
-            trust_remote_code=trust_remote_code,
-            token=token,
-        )
+    processor = _load_processor_with_fallbacks(
+        model_id_or_path,
+        ckpt_dir,
+        meta,
+        trust_remote_code=trust_remote_code,
+        token=token,
+        fallback_processor_id=fallback_processor_id,
+        fallback_processor_subfolder=fallback_processor_subfolder,
+        config_name_or_path=getattr(model.config, "_name_or_path", None),
+    )
 
     return model, processor, meta
 
@@ -430,6 +735,12 @@ def load_model_and_processor(
     module_aliases: Optional[Mapping[str, str]] = None,
     dmrg_block_kwargs: Optional[Mapping[str, Any]] = None,
     dmrg_block_kwargs_by_layer: Optional[Mapping[int, Mapping[str, Any]]] = None,
+    dmrg_replaced_layer_indices: Optional[list[int]] = None,
+    dmrg_block_class_name: Optional[str] = None,
+    dmrg_block_module_name: Optional[str] = None,
+    dmrg_block_source_file: Optional[str] = None,
+    fallback_processor_id: Optional[str] = None,
+    fallback_processor_subfolder: Optional[str] = None,
     device: Optional[str] = None,
 ):
     """
@@ -449,13 +760,8 @@ def load_model_and_processor(
     if tok:
         os.environ["HF_HUB_TOKEN"] = tok
 
-    ckpt_dir: Optional[Path] = None
-    try:
-        ckpt_dir = _resolve_repo_or_local_dir(model_id_or_path, subfolder=subfolder, token=tok)
-    except Exception:
-        ckpt_dir = None
-
-    is_dmrg = ckpt_dir is not None and (ckpt_dir / "dmrg_meta.json").exists()
+    ckpt_dir = _find_dmrg_checkpoint_dir(model_id_or_path, subfolder=subfolder, token=tok)
+    is_dmrg = ckpt_dir is not None
 
     if is_dmrg:
         return _load_dmrg_model_and_processor(
@@ -466,6 +772,12 @@ def load_model_and_processor(
             module_aliases=module_aliases,
             dmrg_block_kwargs=dmrg_block_kwargs,
             dmrg_block_kwargs_by_layer=dmrg_block_kwargs_by_layer,
+            dmrg_replaced_layer_indices=dmrg_replaced_layer_indices,
+            dmrg_block_class_name=dmrg_block_class_name,
+            dmrg_block_module_name=dmrg_block_module_name,
+            dmrg_block_source_file=dmrg_block_source_file,
+            fallback_processor_id=fallback_processor_id,
+            fallback_processor_subfolder=fallback_processor_subfolder,
             device=device_t,
         )
 
@@ -504,12 +816,18 @@ def VIT_metrics(
     module_aliases: Optional[Mapping[str, str]] = None,
     dmrg_block_kwargs: Optional[Mapping[str, Any]] = None,
     dmrg_block_kwargs_by_layer: Optional[Mapping[int, Mapping[str, Any]]] = None,
+    dmrg_replaced_layer_indices: Optional[list[int]] = None,
+    dmrg_block_class_name: Optional[str] = None,
+    dmrg_block_module_name: Optional[str] = None,
+    dmrg_block_source_file: Optional[str] = None,
+    fallback_processor_id: Optional[str] = None,
+    fallback_processor_subfolder: Optional[str] = None,
     shuffle_stream: bool = False,
     shuffle_buffer: int = 10_000,
     seed: int = 0,
     use_amp: bool = True,
     device: Optional[str] = None,
-) -> dict:
+) -> dict[str, Any]:
     """
     Evaluate either a standard HF image-classification repo or a DMRG checkpoint.
 
@@ -522,8 +840,15 @@ def VIT_metrics(
     metrics = VIT_metrics(
         "your-name/your-repo",
         subfolder="dmrg/final",
-        trust_remote_code=False,
-        dmrg_block_kwargs={"some_arg": 123},  # only if your custom block needs it
+        fallback_processor_id="google/vit-base-patch16-224",
+    )
+
+    # Sparse old-style DMRG checkpoint with one custom block file
+    metrics = VIT_metrics(
+        "jcandane/ViU",
+        subfolder="dmrg_test_first_window/sweep_00_down_10_11",
+        dmrg_block_source_file="DiffusionBlock.py",
+        fallback_processor_id="jcandane/ViU",
     )
     """
     if device is None:
@@ -537,6 +862,12 @@ def VIT_metrics(
         module_aliases=module_aliases,
         dmrg_block_kwargs=dmrg_block_kwargs,
         dmrg_block_kwargs_by_layer=dmrg_block_kwargs_by_layer,
+        dmrg_replaced_layer_indices=dmrg_replaced_layer_indices,
+        dmrg_block_class_name=dmrg_block_class_name,
+        dmrg_block_module_name=dmrg_block_module_name,
+        dmrg_block_source_file=dmrg_block_source_file,
+        fallback_processor_id=fallback_processor_id,
+        fallback_processor_subfolder=fallback_processor_subfolder,
         device=device,
     )
 
@@ -570,6 +901,7 @@ def VIT_metrics(
 
     def flush_batch() -> None:
         nonlocal n, top1, top5, total_loss, images, labels
+
         if not images:
             return
 
@@ -603,7 +935,7 @@ def VIT_metrics(
     if n == 0:
         raise RuntimeError("Evaluated 0 samples (stream empty or wrong split?).")
 
-    out = {
+    out: dict[str, Any] = {
         "acc1": top1 / n,
         "acc5": top5 / n,
         "xent": total_loss / n,
@@ -615,6 +947,7 @@ def VIT_metrics(
         out["dmrg_checkpoint"] = True
         out["studentized_layers"] = meta.get("studentized_layers")
         out["replaced_layer_indices"] = meta.get("replaced_layer_indices")
+        out["dmrg_kind"] = meta.get("kind")
     else:
         out["dmrg_checkpoint"] = False
 
