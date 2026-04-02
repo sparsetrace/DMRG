@@ -69,6 +69,27 @@ def _install_module_aliases(module_aliases: Optional[Mapping[str, str]] = None) 
         sys.modules[wanted_name] = module
 
 
+def _hf_pretrained_kwargs(
+    *,
+    trust_remote_code: bool = False,
+    token: Optional[str] = None,
+    subfolder: Optional[str] = None,
+) -> dict[str, Any]:
+    """
+    Build kwargs for HF `.from_pretrained(...)` calls, omitting None values.
+
+    Some transformers versions error on subfolder=None, so do not pass it unless set.
+    """
+    kwargs: dict[str, Any] = {
+        "trust_remote_code": trust_remote_code,
+    }
+    if token is not None:
+        kwargs["token"] = token
+    if subfolder is not None:
+        kwargs["subfolder"] = subfolder
+    return kwargs
+
+
 class ViTBlockAdapter(nn.Module):
     """
     Wrap a custom block so it behaves like the current HF ViT encoder layer.
@@ -213,12 +234,14 @@ def _find_dmrg_checkpoint_dir(
         return None
 
     try:
-        hf_hub_download(
-            repo_id=model_id_or_path,
-            filename="dmrg_meta.json",
-            subfolder=subfolder,
-            token=token,
-        )
+        download_kwargs = {
+            "repo_id": model_id_or_path,
+            "filename": "dmrg_meta.json",
+            "token": token,
+        }
+        if subfolder is not None:
+            download_kwargs["subfolder"] = subfolder
+        hf_hub_download(**download_kwargs)
     except Exception:
         return None
 
@@ -574,9 +597,11 @@ def _build_base_model_for_dmrg(
 
     cfg = AutoConfig.from_pretrained(
         cfg_source,
-        subfolder=cfg_subfolder,
-        trust_remote_code=trust_remote_code,
-        token=token,
+        **_hf_pretrained_kwargs(
+            trust_remote_code=trust_remote_code,
+            token=token,
+            subfolder=cfg_subfolder,
+        ),
     )
 
     try:
@@ -644,9 +669,11 @@ def _load_processor_with_fallbacks(
         try:
             return AutoImageProcessor.from_pretrained(
                 source,
-                subfolder=sf,
-                trust_remote_code=trust_remote_code,
-                token=token,
+                **_hf_pretrained_kwargs(
+                    trust_remote_code=trust_remote_code,
+                    token=token,
+                    subfolder=sf,
+                ),
             )
         except Exception as exc:
             last_err = exc
@@ -785,15 +812,19 @@ def load_model_and_processor(
 
     processor = AutoImageProcessor.from_pretrained(
         model_id_or_path,
-        subfolder=subfolder,
-        trust_remote_code=trust_remote_code,
-        token=tok,
+        **_hf_pretrained_kwargs(
+            trust_remote_code=trust_remote_code,
+            token=tok,
+            subfolder=subfolder,
+        ),
     )
     model = AutoModelForImageClassification.from_pretrained(
         model_id_or_path,
-        subfolder=subfolder,
-        trust_remote_code=trust_remote_code,
-        token=tok,
+        **_hf_pretrained_kwargs(
+            trust_remote_code=trust_remote_code,
+            token=tok,
+            subfolder=subfolder,
+        ),
     ).to(device_t)
     model.eval()
     return model, processor, None
